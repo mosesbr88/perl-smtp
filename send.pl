@@ -4,7 +4,9 @@ use strict;
 use warnings;
 
 use Net::SMTP;
+use Net::DNS;
 use Socket qw(AF_INET6);
+
 use LWP::UserAgent;
 
 use Mail::DKIM::Signer;
@@ -15,27 +17,32 @@ use File::Temp qw(tempfile);
 use POSIX qw(strftime);
 
 # ============================================================
-# CONFIGURATION
+# CONFIG
 # ============================================================
 
-my $DOMAIN      = "sujoy-z.us.to";
-my $SELECTOR    = "default";
-my $FROM        = "test\@$DOMAIN";
+my $DOMAIN       = "sujoy-z.us.to";
+my $SELECTOR     = "default";
+my $FROM         = "test\@$DOMAIN";
 
-# Gmail receiving MX
-my $SMTP_SERVER = "gmail-smtp-in.l.google.com";
-my $SMTP_PORT   = 25;
-
-# IMPORTANT:
-# Do NOT put your previously exposed private key URL here.
-# Use a NEW/ROTATED DKIM private key stored somewhere private.
+# Put your NEW/ROTATED private DKIM key URL here.
+#
+# Do NOT use the previously exposed public private-key file.
 my $KEY_URL = "https://raw.githubusercontent.com/mosesbr88/perl-smtp/refs/heads/main/pvt.txt";
 
-# Your SMTP server hostname used in EHLO
 my $HELO_DOMAIN = $DOMAIN;
 
 # ============================================================
-# DOWNLOAD DKIM PRIVATE KEY
+# DNS RESOLVER
+# ============================================================
+
+my $resolver = Net::DNS::Resolver->new(
+    udp_timeout => 5,
+    tcp_timeout => 10,
+    retry       => 2
+);
+
+# ============================================================
+# LOAD DKIM PRIVATE KEY
 # ============================================================
 
 sub load_dkim_key {
@@ -55,77 +62,129 @@ sub load_dkim_key {
 
     my $key_data = $response->decoded_content;
 
-    # Basic PEM validation
     unless (
         $key_data =~ /-----BEGIN RSA PRIVATE KEY-----/
         ||
         $key_data =~ /-----BEGIN PRIVATE KEY-----/
     ) {
-        die "Downloaded file does not look like a PEM private key.\n";
+        die "Downloaded file does not contain a valid PEM private key.\n";
     }
 
-    # Create temporary PEM file
     my ($fh, $filename) = tempfile(
         "dkim-XXXXXX",
         SUFFIX => ".pem",
         UNLINK => 1
     );
 
-    print $fh $key_data;
-    close $fh;
+    print $fh $key_data
+        or die "Unable to write temporary DKIM key.\n";
 
-    # Mail::DKIM::PrivateKey officially supports loading from File
+    close $fh
+        or die "Unable to close temporary DKIM key.\n";
+
     my $private_key = Mail::DKIM::PrivateKey->load(
         File => $filename
     );
 
-    die "Could not load DKIM private key.\n"
+    die "Unable to load DKIM private key.\n"
         unless $private_key;
 
-    print "DKIM private key loaded successfully.\n";
+    print "DKIM private key loaded.\n";
 
     return $private_key;
 }
 
 # ============================================================
-# CREATE DKIM SIGNATURE
+# EXTRACT DOMAIN FROM EMAIL
 # ============================================================
 
-sub sign_message {
+sub get_domain {
 
-    my ($private_key, $message) = @_;
+    my ($email) = @_;
 
-    my $signer = Mail::DKIM::Signer->new(
-        Algorithm => "rsa-sha256",
-        Method    => "relaxed",
-        Domain    => $DOMAIN,
-        Selector  => $SELECTOR,
-        Key       => $private_key,
+    my ($domain) = $email =~ /\@([^\@]+)$/;
 
-        Headers   => [
-            "From",
-            "To",
-            "Subject",
-            "Date",
-            "Message-ID"
-        ]
+    return unless $domain;
+
+    $domain =~ s/\.$//;
+
+    return lc($domain);
+}
+
+# ============================================================
+# FIND MX RECORDS
+# ============================================================
+
+sub get_mx_records {
+
+    my ($domain) = @_;
+
+    print "\n";
+    print "Looking up MX records for: $domain\n";
+
+    my @mx = Net::DNS::mx(
+        $resolver,
+        $domain
     );
 
-    # Mail::DKIM expects SMTP-style CRLF
-    $message =~ s/\r?\n/\r\n/g;
+    unless (@mx) {
+        print "No MX records found for $domain\n";
+        return;
+    }
 
-    $signer->PRINT($message);
-    $signer->CLOSE();
+    print "MX records found:\n";
 
-    my $signature = $signer->signature;
+    foreach my $mx (@mx) {
 
-    die "DKIM signature generation failed.\n"
-        unless $signature;
+        my $host = $mx->exchange;
+        my $pref = $mx->preference;
 
-    my $dkim_header = $signature->as_string;
+        print "  Preference $pref -> $host\n";
+    }
 
-    # TextWrap handles proper DKIM header folding.
-    return $dkim_header . "\r\n" . $message;
+    return @mx;
+}
+
+# ============================================================
+# GET AAAA RECORDS
+# ============================================================
+
+sub get_ipv6_addresses {
+
+    my ($hostname) = @_;
+
+    print "Looking up AAAA: $hostname\n";
+
+    my $packet = $resolver->query(
+        $hostname,
+        "AAAA"
+    );
+
+    unless ($packet) {
+        print "  AAAA lookup failed: "
+            . $resolver->errorstring . "\n";
+
+        return;
+    }
+
+    my @addresses;
+
+    foreach my $rr ($packet->answer) {
+
+        next unless $rr->type eq "AAAA";
+
+        my $address = $rr->address;
+
+        push @addresses, $address;
+
+        print "  IPv6: $address\n";
+    }
+
+    unless (@addresses) {
+        print "  No IPv6 address found.\n";
+    }
+
+    return @addresses;
 }
 
 # ============================================================
@@ -142,7 +201,7 @@ sub create_message {
     );
 
     my $message_id =
-        "<"
+          "<"
         . time()
         . "."
         . int(rand(1000000))
@@ -165,66 +224,199 @@ EOF
 }
 
 # ============================================================
-# SEND USING IPv6 + STARTTLS
+# DKIM SIGN
+# ============================================================
+
+sub sign_message {
+
+    my ($private_key, $message) = @_;
+
+    my $signer = Mail::DKIM::Signer->new(
+
+        Algorithm => "rsa-sha256",
+
+        Method => "relaxed",
+
+        Domain => $DOMAIN,
+
+        Selector => $SELECTOR,
+
+        Key => $private_key,
+
+        Headers => [
+            "From",
+            "To",
+            "Subject",
+            "Date",
+            "Message-ID"
+        ]
+    );
+
+    # DKIM requires CRLF
+    $message =~ s/\r?\n/\r\n/g;
+
+    $signer->PRINT($message);
+
+    $signer->CLOSE();
+
+    my $signature = $signer->signature;
+
+    die "DKIM signature generation failed.\n"
+        unless $signature;
+
+    my $dkim_header = $signature->as_string;
+
+    return $dkim_header
+        . "\r\n"
+        . $message;
+}
+
+# ============================================================
+# CONNECT TO MX OVER IPV6 + STARTTLS
+# ============================================================
+
+sub connect_mx_ipv6 {
+
+    my ($mx_host) = @_;
+
+    print "\n";
+    print "Trying MX: $mx_host\n";
+
+    # --------------------------------------------------------
+    # Check AAAA first
+    # --------------------------------------------------------
+
+    my @ipv6 = get_ipv6_addresses($mx_host);
+
+    unless (@ipv6) {
+
+        print "Skipping $mx_host because it has no AAAA record.\n";
+
+        return;
+    }
+
+    # --------------------------------------------------------
+    # Connect using IPv6
+    #
+    # Family => AF_INET6 forces IPv6.
+    # Host remains the MX hostname so TLS certificate
+    # verification uses the hostname rather than the IP.
+    # --------------------------------------------------------
+
+    print "Connecting to $mx_host:25 over IPv6...\n";
+
+    my $smtp = Net::SMTP->new(
+
+        Host => $mx_host,
+
+        Port => 25,
+
+        Hello => $HELO_DOMAIN,
+
+        Timeout => 30,
+
+        Family => AF_INET6,
+
+        Debug => 0
+    );
+
+    unless ($smtp) {
+
+        print "IPv6 SMTP connection failed for $mx_host\n";
+
+        return;
+    }
+
+    print "IPv6 SMTP connection established.\n";
+
+    # --------------------------------------------------------
+    # STARTTLS
+    # --------------------------------------------------------
+
+    print "Starting STARTTLS...\n";
+
+    my $tls_ok = eval {
+
+        $smtp->starttls(
+
+            SSL_verify_mode => 1,
+
+            SSL_hostname => $mx_host
+        );
+    };
+
+    if (!$tls_ok) {
+
+        print "STARTTLS failed for $mx_host\n";
+
+        eval {
+            $smtp->quit();
+        };
+
+        return;
+    }
+
+    print "STARTTLS established successfully.\n";
+
+    # --------------------------------------------------------
+    # EHLO again after STARTTLS
+    # --------------------------------------------------------
+
+    unless ($smtp->hello($HELO_DOMAIN)) {
+
+        print "EHLO after STARTTLS failed.\n";
+
+        eval {
+            $smtp->quit();
+        };
+
+        return;
+    }
+
+    print "EHLO after STARTTLS successful.\n";
+
+    return $smtp;
+}
+
+# ============================================================
+# SEND MAIL
 # ============================================================
 
 sub send_mail {
 
-    my ($to, $subject, $body, $private_key) = @_;
+    my (
+        $to,
+        $subject,
+        $body,
+        $private_key
+    ) = @_;
+
+    # --------------------------------------------------------
+    # Get recipient domain
+    # --------------------------------------------------------
+
+    my $recipient_domain = get_domain($to);
+
+    die "Unable to determine recipient domain.\n"
+        unless $recipient_domain;
 
     print "\n";
-    print "========================================\n";
-    print "Connecting to Gmail MX over IPv6...\n";
-    print "Server : $SMTP_SERVER\n";
-    print "Port   : $SMTP_PORT\n";
-    print "========================================\n";
+    print "Recipient : $to\n";
+    print "Domain    : $recipient_domain\n";
 
-    # Force IPv6.
-    #
-    # Net::SMTP passes Family to the underlying socket.
-    # AF_INET6 prevents fallback to IPv4.
-    my $smtp = Net::SMTP->new(
-        Host        => $SMTP_SERVER,
-        Port        => $SMTP_PORT,
-        Hello       => $HELO_DOMAIN,
-        Timeout     => 30,
-        Family      => AF_INET6,
-        Debug       => 0
-    );
+    # --------------------------------------------------------
+    # MX LOOKUP
+    # --------------------------------------------------------
 
-    die "IPv6 SMTP connection failed.\n"
-        unless $smtp;
+    my @mx_records =
+        get_mx_records($recipient_domain);
 
-    print "IPv6 connection established.\n";
+    die "No MX records available for $recipient_domain.\n"
+        unless @mx_records;
 
-    # ========================================================
-    # STARTTLS
-    # ========================================================
-
-    print "Starting STARTTLS...\n";
-
-    my $tls_ok = $smtp->starttls(
-        SSL_verify_mode => 1,
-        SSL_hostname    => $SMTP_SERVER
-    );
-
-    die "STARTTLS negotiation failed.\n"
-        unless $tls_ok;
-
-    print "STARTTLS/TLS established successfully.\n";
-
-    # ========================================================
-    # EHLO AGAIN AFTER STARTTLS
-    # ========================================================
-
-    $smtp->hello($HELO_DOMAIN)
-        or die "EHLO after STARTTLS failed.\n";
-
-    print "EHLO after TLS successful.\n";
-
-    # ========================================================
+    # --------------------------------------------------------
     # CREATE MESSAGE
-    # ========================================================
+    # --------------------------------------------------------
 
     my $message = create_message(
         $to,
@@ -232,11 +424,11 @@ sub send_mail {
         $body
     );
 
-    # ========================================================
+    # --------------------------------------------------------
     # DKIM SIGN
-    # ========================================================
+    # --------------------------------------------------------
 
-    print "Generating DKIM signature...\n";
+    print "\nGenerating DKIM signature...\n";
 
     my $signed_message = sign_message(
         $private_key,
@@ -245,53 +437,156 @@ sub send_mail {
 
     print "DKIM signature generated.\n";
 
-    # ========================================================
-    # SMTP ENVELOPE
-    # ========================================================
+    # --------------------------------------------------------
+    # TRY MX RECORDS IN PREFERENCE ORDER
+    # --------------------------------------------------------
 
-    print "Sending MAIL FROM...\n";
+    foreach my $mx (@mx_records) {
 
-    $smtp->mail($FROM)
-        or die "MAIL FROM failed.\n";
+        my $mx_host = $mx->exchange;
 
-    print "Sending RCPT TO...\n";
+        # Remove final DNS dot
+        $mx_host =~ s/\.$//;
 
-    $smtp->to($to)
-        or die "RCPT TO failed for $to\n";
+        my $preference = $mx->preference;
 
-    print "Sending DATA...\n";
+        print "\n";
+        print "========================================\n";
+        print "MX Preference : $preference\n";
+        print "MX Host       : $mx_host\n";
+        print "========================================\n";
 
-    $smtp->data()
-        or die "DATA command failed.\n";
+        # ----------------------------------------------------
+        # CONNECT IPv6 + STARTTLS
+        # ----------------------------------------------------
 
-    $smtp->datasend($signed_message)
-        or die "Failed to send message data.\n";
+        my $smtp =
+            connect_mx_ipv6($mx_host);
 
-    $smtp->dataend()
-        or die "DATA END failed.\n";
+        unless ($smtp) {
 
-    print "\n";
-    print "========================================\n";
-    print "SMTP MESSAGE ACCEPTED BY GMAIL MX\n";
-    print "========================================\n";
+            print "MX failed. Trying next MX...\n";
 
-    $smtp->quit();
+            next;
+        }
 
-    print "Connection closed.\n";
+        # ----------------------------------------------------
+        # MAIL FROM
+        # ----------------------------------------------------
+
+        print "MAIL FROM: $FROM\n";
+
+        unless ($smtp->mail($FROM)) {
+
+            print "MAIL FROM failed.\n";
+
+            eval {
+                $smtp->quit();
+            };
+
+            next;
+        }
+
+        # ----------------------------------------------------
+        # RCPT TO
+        # ----------------------------------------------------
+
+        print "RCPT TO: $to\n";
+
+        unless ($smtp->to($to)) {
+
+            print "RCPT TO failed.\n";
+
+            eval {
+                $smtp->quit();
+            };
+
+            next;
+        }
+
+        # ----------------------------------------------------
+        # DATA
+        # ----------------------------------------------------
+
+        print "Sending DATA...\n";
+
+        unless ($smtp->data()) {
+
+            print "DATA command failed.\n";
+
+            eval {
+                $smtp->quit();
+            };
+
+            next;
+        }
+
+        unless ($smtp->datasend($signed_message)) {
+
+            print "Failed to send message data.\n";
+
+            eval {
+                $smtp->quit();
+            };
+
+            next;
+        }
+
+        unless ($smtp->dataend()) {
+
+            print "DATA END failed.\n";
+
+            eval {
+                $smtp->quit();
+            };
+
+            next;
+        }
+
+        # ----------------------------------------------------
+        # SUCCESS
+        # ----------------------------------------------------
+
+        print "\n";
+        print "========================================\n";
+        print "MESSAGE ACCEPTED BY MX\n";
+        print "========================================\n";
+        print "MX       : $mx_host\n";
+        print "IPv6     : YES\n";
+        print "STARTTLS : YES\n";
+        print "DKIM     : YES\n";
+        print "========================================\n";
+
+        eval {
+            $smtp->quit();
+        };
+
+        return 1;
+    }
+
+    die "\nAll IPv6 MX servers failed.\n";
 }
 
 # ============================================================
-# LOAD KEY ONCE
+# LOAD DKIM KEY
 # ============================================================
 
 my $dkim_key = load_dkim_key();
 
+# ============================================================
+# START
+# ============================================================
+
 print "\n";
 print "========================================\n";
-print "IPv6 + STARTTLS + DKIM SMTP SENDER\n";
-print "Domain : $DOMAIN\n";
-print "From   : $FROM\n";
-print "MX     : $SMTP_SERVER:$SMTP_PORT\n";
+print "AUTOMATIC MX SMTP SENDER\n";
+print "========================================\n";
+print "From       : $FROM\n";
+print "Domain     : $DOMAIN\n";
+print "IPv6       : ENABLED\n";
+print "STARTTLS   : REQUIRED\n";
+print "DKIM       : ENABLED\n";
+print "MX lookup  : AUTOMATIC\n";
 print "========================================\n";
 
 # ============================================================
@@ -301,25 +596,62 @@ print "========================================\n";
 while (1) {
 
     print "\nReceiver email (or 'exit'): ";
-    chomp(my $to = <STDIN>);
+
+    my $to = <STDIN>;
+
+    last unless defined $to;
+
+    chomp $to;
 
     last if lc($to) eq "exit";
 
-    unless ($to =~ /^[A-Za-z0-9.!#\$%&'*+\/=?^_`{|}~-]+\@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$/) {
+    # --------------------------------------------------------
+    # Basic email validation
+    # --------------------------------------------------------
+
+    unless (
+        $to =~
+        /^[A-Za-z0-9.!#\$%&'*+\/=?^_`{|}~-]+\@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$/
+    ) {
+
         print "Invalid email address.\n";
+
         next;
     }
 
-    print "Subject: ";
-    chomp(my $subject = <STDIN>);
+    # --------------------------------------------------------
+    # Subject
+    # --------------------------------------------------------
 
-    # Prevent header injection
+    print "Subject: ";
+
+    my $subject = <STDIN>;
+
+    last unless defined $subject;
+
+    chomp $subject;
+
+    # Prevent SMTP header injection
     $subject =~ s/[\r\n]//g;
 
+    # --------------------------------------------------------
+    # Body
+    # --------------------------------------------------------
+
     print "Body: ";
-    chomp(my $body = <STDIN>);
+
+    my $body = <STDIN>;
+
+    last unless defined $body;
+
+    chomp $body;
+
+    # --------------------------------------------------------
+    # SEND
+    # --------------------------------------------------------
 
     eval {
+
         send_mail(
             $to,
             $subject,
@@ -329,8 +661,15 @@ while (1) {
     };
 
     if ($@) {
-        print "\nSEND FAILED:\n$@\n";
-    } else {
+
+        print "\n";
+        print "========================================\n";
+        print "SEND FAILED\n";
+        print "========================================\n";
+        print $@;
+    }
+    else {
+
         print "\nMail sent successfully.\n";
     }
 }
