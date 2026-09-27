@@ -10,7 +10,7 @@ use Socket qw(AF_INET AF_INET6);
 # CONFIG
 # ============================================================
 
-my $DOMAIN   = "YOUR_DOMAIN.COM";
+my $DOMAIN   = "sujoy-z.us.to";
 my $SELECTOR = "default";
 
 my $FROM = "test\@$DOMAIN";
