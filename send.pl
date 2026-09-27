@@ -1,545 +1,336 @@
-
 #!/usr/bin/perl
 
 use strict;
 use warnings;
 
 use Net::SMTP;
+use Socket qw(AF_INET6);
 use LWP::UserAgent;
+
 use Mail::DKIM::Signer;
 use Mail::DKIM::PrivateKey;
 use Mail::DKIM::TextWrap;
+
 use File::Temp qw(tempfile);
 use POSIX qw(strftime);
 
 # ============================================================
-# CONFIG
+# CONFIGURATION
 # ============================================================
 
-my $DOMAIN   = "sujoy-z.us.to";
-my $SELECTOR = "default";
+my $DOMAIN      = "sujoy-z.us.to";
+my $SELECTOR    = "default";
+my $FROM        = "test\@$DOMAIN";
 
-my $FROM = "test\@$DOMAIN";
-
+# Gmail receiving MX
 my $SMTP_SERVER = "gmail-smtp-in.l.google.com";
 my $SMTP_PORT   = 25;
 
 # IMPORTANT:
-# Use a PRIVATE URL for the DKIM private key.
-# Do NOT keep the private key in a public GitHub repository.
+# Do NOT put your previously exposed private key URL here.
+# Use a NEW/ROTATED DKIM private key stored somewhere private.
 my $KEY_URL = "https://raw.githubusercontent.com/mosesbr88/perl-smtp/refs/heads/main/pvt.txt";
 
+# Your SMTP server hostname used in EHLO
+my $HELO_DOMAIN = $DOMAIN;
+
 # ============================================================
-# DOWNLOAD PRIVATE KEY
+# DOWNLOAD DKIM PRIVATE KEY
 # ============================================================
 
-sub download_private_key {
+sub load_dkim_key {
 
-    print "[*] Downloading DKIM private key...\n";
+    print "Downloading DKIM private key...\n";
 
     my $ua = LWP::UserAgent->new(
         timeout => 20,
-        agent   => "Perl-DKIM-Sender/1.0",
+        agent   => "Perl-SMTP/1.0"
     );
 
     my $response = $ua->get($KEY_URL);
 
-    unless ($response->is_success) {
-        die "[DKIM ERROR] Cannot download private key: "
-          . $response->status_line
-          . "\n";
+    die "Failed to download DKIM key: "
+        . $response->status_line . "\n"
+        unless $response->is_success;
+
+    my $key_data = $response->decoded_content;
+
+    # Basic PEM validation
+    unless (
+        $key_data =~ /-----BEGIN RSA PRIVATE KEY-----/
+        ||
+        $key_data =~ /-----BEGIN PRIVATE KEY-----/
+    ) {
+        die "Downloaded file does not look like a PEM private key.\n";
     }
 
-    my $key = $response->decoded_content;
-
-    # Remove UTF-8 BOM if present
-    $key =~ s/^\x{FEFF}//;
-
-    # Remove surrounding whitespace
-    $key =~ s/^\s+//;
-    $key =~ s/\s+$//;
-
-    # Accept normal RSA PEM
-    if ($key =~ /-----BEGIN RSA PRIVATE KEY-----/) {
-
-        unless ($key =~ /-----END RSA PRIVATE KEY-----/) {
-            die "[DKIM ERROR] RSA private key is incomplete.\n";
-        }
-
-    # Also accept PKCS#8 PEM
-    } elsif ($key =~ /-----BEGIN PRIVATE KEY-----/) {
-
-        unless ($key =~ /-----END PRIVATE KEY-----/) {
-            die "[DKIM ERROR] PKCS#8 private key is incomplete.\n";
-        }
-
-    } else {
-
-        die "[DKIM ERROR] Downloaded file does not contain a PEM private key.\n";
-    }
-
-    print "[+] Private key downloaded\n";
-
-    return $key;
-}
-
-# ============================================================
-# CREATE MAIL::DKIM::PrivateKey
-# ============================================================
-
-sub create_dkim_key {
-
-    my ($pem) = @_;
-
-    print "[*] Loading DKIM private key...\n";
-
+    # Create temporary PEM file
     my ($fh, $filename) = tempfile(
-        "dkim-key-XXXXXX",
-        TMPDIR => 1,
-        UNLINK => 1,
+        "dkim-XXXXXX",
+        SUFFIX => ".pem",
+        UNLINK => 1
     );
 
-    binmode($fh);
+    print $fh $key_data;
+    close $fh;
 
-    print $fh $pem;
+    # Mail::DKIM::PrivateKey officially supports loading from File
+    my $private_key = Mail::DKIM::PrivateKey->load(
+        File => $filename
+    );
 
-    close($fh)
-        or die "[DKIM ERROR] Cannot close temporary key file: $!\n";
+    die "Could not load DKIM private key.\n"
+        unless $private_key;
 
-    my $dkim_key;
+    print "DKIM private key loaded successfully.\n";
 
-    eval {
-
-        $dkim_key = Mail::DKIM::PrivateKey->load(
-            File => $filename,
-        );
-
-    };
-
-    if ($@ || !$dkim_key) {
-
-        die
-            "[DKIM ERROR] Cannot load DKIM private key.\n"
-          . ($@ || "Unknown error")
-          . "\n";
-    }
-
-    print "[+] DKIM private key loaded\n";
-
-    return $dkim_key;
+    return $private_key;
 }
 
 # ============================================================
-# INITIALIZE DKIM
+# CREATE DKIM SIGNATURE
 # ============================================================
 
-my $PRIVATE_KEY_PEM = download_private_key();
+sub sign_message {
 
-my $DKIM_KEY = create_dkim_key($PRIVATE_KEY_PEM);
+    my ($private_key, $message) = @_;
 
-# ============================================================
-# EMAIL VALIDATION
-# ============================================================
+    my $signer = Mail::DKIM::Signer->new(
+        Algorithm => "rsa-sha256",
+        Method    => "relaxed",
+        Domain    => $DOMAIN,
+        Selector  => $SELECTOR,
+        Key       => $private_key,
 
-sub valid_email {
+        Headers   => [
+            "From",
+            "To",
+            "Subject",
+            "Date",
+            "Message-ID"
+        ]
+    );
 
-    my ($email) = @_;
+    # Mail::DKIM expects SMTP-style CRLF
+    $message =~ s/\r?\n/\r\n/g;
 
-    return 0 unless defined $email;
+    $signer->PRINT($message);
+    $signer->CLOSE();
 
-    return 0 unless
-        $email =~ /^[^\s\@]+\@[^\s\@]+\.[^\s\@]+$/;
+    my $signature = $signer->signature;
 
-    return 1;
+    die "DKIM signature generation failed.\n"
+        unless $signature;
+
+    my $dkim_header = $signature->as_string;
+
+    # TextWrap handles proper DKIM header folding.
+    return $dkim_header . "\r\n" . $message;
 }
 
 # ============================================================
-# SEND EMAIL
+# CREATE MESSAGE
 # ============================================================
 
-sub send_email {
+sub create_message {
 
     my ($to, $subject, $body) = @_;
 
-    print "\n";
-    print "[*] Creating message...\n";
-
-    # --------------------------------------------------------
-    # DATE
-    # --------------------------------------------------------
-
     my $date = strftime(
-        "%a, %d %b %Y %H:%M:%S +0000",
-        gmtime()
+        "%a, %d %b %Y %H:%M:%S %z",
+        localtime
     );
 
-    # --------------------------------------------------------
-    # MESSAGE ID
-    # --------------------------------------------------------
-
     my $message_id =
-          time()
+        "<"
+        . time()
         . "."
         . int(rand(1000000))
-        . "\@"
-        . $DOMAIN;
-
-    # --------------------------------------------------------
-    # MESSAGE
-    # --------------------------------------------------------
-
-    my $message =
-          "From: <$FROM>\r\n"
-        . "To: <$to>\r\n"
-        . "Subject: $subject\r\n"
-        . "Date: $date\r\n"
-        . "Message-ID: <$message_id>\r\n"
-        . "MIME-Version: 1.0\r\n"
-        . "Content-Type: text/plain; charset=UTF-8\r\n"
-        . "Content-Transfer-Encoding: 8bit\r\n"
-        . "\r\n"
-        . $body
-        . "\r\n";
-
-    # --------------------------------------------------------
-    # DKIM SIGNER
-    # --------------------------------------------------------
-
-    print "[*] Creating DKIM signature...\n";
-
-    my $dkim;
-
-    eval {
-
-        $dkim = Mail::DKIM::Signer->new(
-            Algorithm => "rsa-sha256",
-            Method    => "relaxed",
-            Domain    => $DOMAIN,
-            Selector  => $SELECTOR,
-            Key       => $DKIM_KEY,
-        );
-
-    };
-
-    if ($@ || !$dkim) {
-
-        print "[!] DKIM signer creation failed:\n";
-        print $@ if $@;
-
-        return 0;
-    }
-
-    # --------------------------------------------------------
-    # FEED MESSAGE TO DKIM
-    # --------------------------------------------------------
-
-    eval {
-
-        $dkim->PRINT($message);
-        $dkim->CLOSE();
-
-    };
-
-    if ($@) {
-
-        print "[!] DKIM signing failed:\n";
-        print $@;
-
-        return 0;
-    }
-
-    # --------------------------------------------------------
-    # GET SIGNATURE
-    # --------------------------------------------------------
-
-    my $signature;
-
-    eval {
-
-        $signature = $dkim->signature();
-
-    };
-
-    if ($@ || !$signature) {
-
-        print "[!] Could not generate DKIM signature\n";
-        print $@ if $@;
-
-        return 0;
-    }
-
-    # --------------------------------------------------------
-    # DKIM HEADER
-    # --------------------------------------------------------
-
-    my $dkim_header;
-
-    eval {
-
-        $dkim_header = $signature->as_string();
-
-    };
-
-    if ($@ || !$dkim_header) {
-
-        print "[!] Could not create DKIM header\n";
-        print $@ if $@;
-
-        return 0;
-    }
-
-    # Add DKIM header before all normal headers
-    $message =
-          $dkim_header
-        . "\r\n"
-        . $message;
-
-    print "[+] DKIM signature generated\n";
-
-    # --------------------------------------------------------
-    # CONNECT TO GMAIL MX
-    # --------------------------------------------------------
-
-    print "[*] Connecting to "
-        . $SMTP_SERVER
-        . ":"
-        . $SMTP_PORT
-        . "...\n";
-
-    my $smtp;
-
-    eval {
-
-        $smtp = Net::SMTP->new(
-            $SMTP_SERVER,
-            Port    => $SMTP_PORT,
-            Timeout => 30,
-            Hello   => $DOMAIN,
-            Debug   => 0,
-        );
-
-    };
-
-    if ($@) {
-
-        print "[!] SMTP connection error:\n";
-        print $@;
-
-        return 0;
-    }
-
-    unless ($smtp) {
-
-        print "[!] Could not connect to Gmail MX\n";
-
-        return 0;
-    }
-
-    print "[+] Connected to Gmail MX\n";
-
-    # --------------------------------------------------------
-    # MAIL FROM
-    # --------------------------------------------------------
-
-    unless ($smtp->mail($FROM)) {
-
-        print "[!] MAIL FROM rejected\n";
-
-        $smtp->quit();
-
-        return 0;
-    }
-
-    print "[+] MAIL FROM accepted\n";
-
-    # --------------------------------------------------------
-    # RCPT TO
-    # --------------------------------------------------------
-
-    unless ($smtp->to($to)) {
-
-        print "[!] RCPT TO rejected\n";
-
-        $smtp->quit();
-
-        return 0;
-    }
-
-    print "[+] RCPT TO accepted\n";
-
-    # --------------------------------------------------------
-    # DATA
-    # --------------------------------------------------------
-
-    unless ($smtp->data()) {
-
-        print "[!] DATA command rejected\n";
-
-        $smtp->quit();
-
-        return 0;
-    }
-
-    # --------------------------------------------------------
-    # SEND MESSAGE
-    # --------------------------------------------------------
-
-    unless ($smtp->datasend($message)) {
-
-        print "[!] Failed to send message data\n";
-
-        $smtp->quit();
-
-        return 0;
-    }
-
-    # --------------------------------------------------------
-    # END DATA
-    # --------------------------------------------------------
-
-    unless ($smtp->dataend()) {
-
-        print "[!] Gmail rejected message after DATA\n";
-
-        $smtp->quit();
-
-        return 0;
-    }
-
-    # --------------------------------------------------------
-    # SUCCESS
-    # --------------------------------------------------------
-
-    print "\n";
-    print "========================================\n";
-    print "       SMTP MESSAGE ACCEPTED\n";
-    print "========================================\n";
-    print "From    : $FROM\n";
-    print "To      : $to\n";
-    print "Subject : $subject\n";
-    print "DKIM    : $SELECTOR._domainkey.$DOMAIN\n";
-    print "Server  : $SMTP_SERVER:$SMTP_PORT\n";
-    print "========================================\n";
-
-    $smtp->quit();
-
-    return 1;
+        . "\@$DOMAIN>";
+
+    my $message = <<"EOF";
+From: $FROM
+To: $to
+Subject: $subject
+Date: $date
+Message-ID: $message_id
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+$body
+EOF
+
+    return $message;
 }
 
 # ============================================================
-# CTRL+C
+# SEND USING IPv6 + STARTTLS
 # ============================================================
 
-$SIG{INT} = sub {
+sub send_mail {
 
-    print "\n\nExiting...\n";
-
-    exit 0;
-};
-
-# ============================================================
-# START
-# ============================================================
-
-print "\n";
-print "========================================\n";
-print "       DIRECT SMTP MAIL SENDER\n";
-print "========================================\n";
-print "Domain  : $DOMAIN\n";
-print "From    : $FROM\n";
-print "Server  : $SMTP_SERVER:$SMTP_PORT\n";
-print "DKIM    : $SELECTOR._domainkey.$DOMAIN\n";
-print "========================================\n";
-print "[+] DKIM system initialized\n";
-
-# ============================================================
-# MAIN LOOP
-# ============================================================
-
-while (1) {
+    my ($to, $subject, $body, $private_key) = @_;
 
     print "\n";
+    print "========================================\n";
+    print "Connecting to Gmail MX over IPv6...\n";
+    print "Server : $SMTP_SERVER\n";
+    print "Port   : $SMTP_PORT\n";
+    print "========================================\n";
 
-    # --------------------------------------------------------
-    # RECEIVER
-    # --------------------------------------------------------
+    # Force IPv6.
+    #
+    # Net::SMTP passes Family to the underlying socket.
+    # AF_INET6 prevents fallback to IPv4.
+    my $smtp = Net::SMTP->new(
+        Host        => $SMTP_SERVER,
+        Port        => $SMTP_PORT,
+        Hello       => $HELO_DOMAIN,
+        Timeout     => 30,
+        Family      => AF_INET6,
+        Debug       => 0
+    );
 
-    print "Receiver email: ";
+    die "IPv6 SMTP connection failed.\n"
+        unless $smtp;
 
-    my $to = <STDIN>;
+    print "IPv6 connection established.\n";
 
-    last unless defined $to;
+    # ========================================================
+    # STARTTLS
+    # ========================================================
 
-    chomp($to);
+    print "Starting STARTTLS...\n";
 
-    $to =~ s/^\s+//;
-    $to =~ s/\s+$//;
+    my $tls_ok = $smtp->starttls(
+        SSL_verify_mode => 1,
+        SSL_hostname    => $SMTP_SERVER
+    );
 
-    if ($to eq "") {
+    die "STARTTLS negotiation failed.\n"
+        unless $tls_ok;
 
-        print "[!] Receiver email cannot be empty.\n";
+    print "STARTTLS/TLS established successfully.\n";
 
-        next;
-    }
+    # ========================================================
+    # EHLO AGAIN AFTER STARTTLS
+    # ========================================================
 
-    unless (valid_email($to)) {
+    $smtp->hello($HELO_DOMAIN)
+        or die "EHLO after STARTTLS failed.\n";
 
-        print "[!] Invalid email address.\n";
+    print "EHLO after TLS successful.\n";
 
-        next;
-    }
+    # ========================================================
+    # CREATE MESSAGE
+    # ========================================================
 
-    # --------------------------------------------------------
-    # SUBJECT
-    # --------------------------------------------------------
-
-    print "Title: ";
-
-    my $subject = <STDIN>;
-
-    last unless defined $subject;
-
-    chomp($subject);
-
-    # Prevent header injection
-    $subject =~ s/[\r\n]+/ /g;
-
-    if ($subject eq "") {
-
-        print "[!] Title cannot be empty.\n";
-
-        next;
-    }
-
-    # --------------------------------------------------------
-    # BODY
-    # --------------------------------------------------------
-
-    print "Body: ";
-
-    my $body = <STDIN>;
-
-    last unless defined $body;
-
-    chomp($body);
-
-    if ($body eq "") {
-
-        print "[!] Body cannot be empty.\n";
-
-        next;
-    }
-
-    # --------------------------------------------------------
-    # SEND
-    # --------------------------------------------------------
-
-    send_email(
+    my $message = create_message(
         $to,
         $subject,
         $body
     );
 
+    # ========================================================
+    # DKIM SIGN
+    # ========================================================
+
+    print "Generating DKIM signature...\n";
+
+    my $signed_message = sign_message(
+        $private_key,
+        $message
+    );
+
+    print "DKIM signature generated.\n";
+
+    # ========================================================
+    # SMTP ENVELOPE
+    # ========================================================
+
+    print "Sending MAIL FROM...\n";
+
+    $smtp->mail($FROM)
+        or die "MAIL FROM failed.\n";
+
+    print "Sending RCPT TO...\n";
+
+    $smtp->to($to)
+        or die "RCPT TO failed for $to\n";
+
+    print "Sending DATA...\n";
+
+    $smtp->data()
+        or die "DATA command failed.\n";
+
+    $smtp->datasend($signed_message)
+        or die "Failed to send message data.\n";
+
+    $smtp->dataend()
+        or die "DATA END failed.\n";
+
     print "\n";
-    print "[*] Ready for next email...\n";
+    print "========================================\n";
+    print "SMTP MESSAGE ACCEPTED BY GMAIL MX\n";
+    print "========================================\n";
+
+    $smtp->quit();
+
+    print "Connection closed.\n";
+}
+
+# ============================================================
+# LOAD KEY ONCE
+# ============================================================
+
+my $dkim_key = load_dkim_key();
+
+print "\n";
+print "========================================\n";
+print "IPv6 + STARTTLS + DKIM SMTP SENDER\n";
+print "Domain : $DOMAIN\n";
+print "From   : $FROM\n";
+print "MX     : $SMTP_SERVER:$SMTP_PORT\n";
+print "========================================\n";
+
+# ============================================================
+# SEND LOOP
+# ============================================================
+
+while (1) {
+
+    print "\nReceiver email (or 'exit'): ";
+    chomp(my $to = <STDIN>);
+
+    last if lc($to) eq "exit";
+
+    unless ($to =~ /^[A-Za-z0-9.!#\$%&'*+\/=?^_`{|}~-]+\@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$/) {
+        print "Invalid email address.\n";
+        next;
+    }
+
+    print "Subject: ";
+    chomp(my $subject = <STDIN>);
+
+    # Prevent header injection
+    $subject =~ s/[\r\n]//g;
+
+    print "Body: ";
+    chomp(my $body = <STDIN>);
+
+    eval {
+        send_mail(
+            $to,
+            $subject,
+            $body,
+            $dkim_key
+        );
+    };
+
+    if ($@) {
+        print "\nSEND FAILED:\n$@\n";
+    } else {
+        print "\nMail sent successfully.\n";
+    }
 }
